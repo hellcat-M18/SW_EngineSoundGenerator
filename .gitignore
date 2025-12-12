@@ -1,0 +1,12 @@
+# Virtual environments
+.venv/
+
+# Python cache
+__pycache__/
+
+# Results and logs
+results/
+
+# OS files
+.DS_Store
+Thumbs.db

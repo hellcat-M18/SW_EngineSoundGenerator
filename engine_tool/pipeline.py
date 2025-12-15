@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Callable
 
-from .audio_loop import encode_vorbis, extract_loop, load_audio_mono
+from .audio_loop import encode_vorbis, extract_loop, load_audio_mono, write_wav_pcm16
 from .compiler import run_component_compiler
 from .models import EngineJob, PipelineResult, ProgressCallback, StageInput
 from .utils import sanitize_filename_component
@@ -17,6 +17,10 @@ def process_stage(stage: StageInput, output_path: Path, search_radius: int, ogg_
         progress(f"Processing {stage.label}: loading audio…")
     samples, sr = load_audio_mono(stage.source_path)
     loop = extract_loop(samples, sr, stage.start_sec, stage.end_sec, search_radius)
+    debug_wav = output_path.with_suffix(".wav")
+    write_wav_pcm16(loop, sr, debug_wav)
+    if progress:
+        progress(f"Processing {stage.label}: wrote debug WAV {debug_wav.name}")
     if progress:
         progress(f"Processing {stage.label}: encoding Vorbis (q={ogg_quality})…")
     encode_vorbis(loop, sr, ogg_quality, output_path, ffmpeg_path=ffmpeg_path)
@@ -66,6 +70,7 @@ def run_pipeline(job: EngineJob, progress: ProgressCallback | None = None) -> Pi
     bracket_label = sanitize_filename_component(job.engine_name, fallback=job.engine_slug)
     staged_files: list[Path] = []
     loop_paths: list[Path] = []
+    wav_paths: list[Path] = []
     try:
         safe_slug = job.engine_slug.replace("-", "_")
         for idx, stage in enumerate(job.stages):
@@ -73,6 +78,9 @@ def run_pipeline(job: EngineJob, progress: ProgressCallback | None = None) -> Pi
             process_stage(stage, loop_path, job.loop_params.search_radius, job.loop_params.ogg_quality, job.ffmpeg_path, progress)
             loop_paths.append(loop_path)
             staged_files.append(loop_path)
+            wav_path = loop_path.with_suffix(".wav")
+            wav_paths.append(wav_path)
+            staged_files.append(wav_path)
             if progress:
                 progress(f"Processing {stage.label}: prepared {loop_path.name}")
         xml_path = compiler_dir / f"[{bracket_label}]modular_engine_crankshaft.xml"
@@ -91,10 +99,14 @@ def run_pipeline(job: EngineJob, progress: ProgressCallback | None = None) -> Pi
         post_bins = {p.resolve() for p in compiler_dir.glob("*.bin")}
         new_bins = sorted(post_bins - preexisting_bins, key=lambda p: p.stat().st_mtime)
         if progress:
-            progress("Archiving XML/OGG artifacts…")
+            progress("Archiving XML/OGG/WAV artifacts…")
         for loop_path in loop_paths:
             target_path = _reserve_destination(run_dir / loop_path.name)
             shutil.copy2(loop_path, target_path)
+        for wav_path in wav_paths:
+            if wav_path.exists():
+                target_path = _reserve_destination(run_dir / wav_path.name)
+                shutil.copy2(wav_path, target_path)
         xml_target = _reserve_destination(run_dir / xml_path.name)
         shutil.copy2(xml_path, xml_target)
         bin_outputs: list[Path] = []

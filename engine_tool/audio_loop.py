@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,23 +19,112 @@ class ZeroCross:
     slope: int
 
 
-def apply_zero_locked_crossfade(loop_samples: np.ndarray, fade_samples: int = 4096) -> np.ndarray:
-    """Blend loop start/end using a long crossfade without forcing zeros."""
-    if loop_samples.size <= 4:
+def _boundary_cost(loop: np.ndarray, start_offset: int, window: int, grad_weight: float = 0.5) -> float:
+    """Cost of loop seam if loop starts at start_offset (circular)."""
+    n = loop.size
+    if n < window * 2 + 4:
+        return math.inf
+    base = np.arange(window, dtype=np.int64)
+    idx_start = (base + start_offset) % n
+    idx_end = (base + start_offset - window) % n
+    a = loop[idx_start].astype(np.float64, copy=False)
+    b = loop[idx_end].astype(np.float64, copy=False)
+    diff = a - b
+    rms = float(np.mean(diff * diff))
+    if grad_weight <= 0:
+        return rms
+    da = np.diff(a)
+    db = np.diff(b)
+    dd = da - db
+    grad = float(np.mean(dd * dd))
+    return rms + grad_weight * grad
+
+
+def rotate_loop_for_best_boundary(loop_samples: np.ndarray, search: int = 2048) -> np.ndarray:
+    """Rotate the loop to the least-audible boundary within a local search range."""
+    n = int(loop_samples.size)
+    if n < 4096:
         return loop_samples
-    fade = min(fade_samples, loop_samples.size // 2)
-    if fade <= 0:
+    search = int(min(max(0, search), n // 2))
+    if search <= 0:
         return loop_samples
-    result = loop_samples.copy()
-    start_slice = slice(0, fade)
-    end_slice = slice(result.size - fade, result.size)
-    start_region = result[start_slice].copy()
-    end_region = result[end_slice].copy()
-    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-    blended = end_region * (1.0 - ramp) + start_region * ramp
-    result[start_slice] = blended
-    result[end_slice] = blended[::-1]
+    window = int(min(1024, max(128, n // 40)))
+    if n < window * 2 + 4:
+        return loop_samples
+
+    best_shift = 0
+    best = math.inf
+    # Search small rotations around the current boundary.
+    for shift in range(-search, search + 1):
+        cost = _boundary_cost(loop_samples, shift, window, grad_weight=0.75)
+        if cost < best:
+            best = cost
+            best_shift = shift
+    if best_shift == 0:
+        return loop_samples
+    return np.roll(loop_samples, -best_shift).astype(np.float32, copy=False)
+
+
+def apply_circular_declick(loop_samples: np.ndarray, blend_samples: int = 2048, smooth_passes: int = 0) -> np.ndarray:
+    """Reduce clicks by smoothing only around the loop boundary.
+
+    This keeps the loop length unchanged and does not force endpoints to zero.
+    It blends the head and tail symmetrically, then optionally applies a tiny smoothing filter to
+    the boundary region.
+    """
+    if loop_samples.size <= 64:
+        return loop_samples
+    blend = int(min(blend_samples, max(16, loop_samples.size // 8)))
+    if blend <= 0 or loop_samples.size <= 2 * blend + 8:
+        return loop_samples
+
+    result = loop_samples.astype(np.float32, copy=True)
+    head = result[:blend].copy()
+    tail = result[-blend:].copy()
+    # Equal-power crossfade to avoid perceived level dip.
+    theta = np.linspace(0.0, math.pi / 2.0, blend, dtype=np.float32)
+    a = np.cos(theta)  # 1 -> 0
+    b = np.sin(theta)  # 0 -> 1
+    # Symmetric blend at both ends.
+    blended_head = (a * head) + (b * tail)
+    blended_tail = (a * tail) + (b * head)
+
+    # RMS normalize the boundary to avoid level bumps when signals are correlated.
+    eps = 1e-12
+    target_rms = float(0.5 * (np.sqrt(np.mean(head * head) + eps) + np.sqrt(np.mean(tail * tail) + eps)))
+    blended_rms = float(0.5 * (np.sqrt(np.mean(blended_head * blended_head) + eps) + np.sqrt(np.mean(blended_tail * blended_tail) + eps)))
+    if blended_rms > eps and target_rms > eps:
+        gain = target_rms / blended_rms
+        gain = float(np.clip(gain, 0.5, 1.5))
+        blended_head *= gain
+        blended_tail *= gain
+
+    result[:blend] = blended_head
+    result[-blend:] = blended_tail
+
+    if smooth_passes <= 0:
+        return result
+    # Very small 3-tap smoothing, applied only inside the boundary bands.
+    for _ in range(int(smooth_passes)):
+        band = np.concatenate([result[-blend:], result[:blend]]).astype(np.float32, copy=False)
+        padded = np.concatenate([band[-1:], band, band[:1]])
+        smoothed = (0.25 * padded[:-2]) + (0.5 * padded[1:-1]) + (0.25 * padded[2:])
+        smoothed = smoothed.astype(np.float32, copy=False)
+        result[-blend:] = smoothed[:blend]
+        result[:blend] = smoothed[blend:]
     return result
+
+
+def write_wav_pcm16(samples: np.ndarray, sr: int, output_path: Path) -> None:
+    """Write mono PCM16 WAV for debugging/analysis."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    clipped = np.clip(samples.astype(np.float32, copy=False), -1.0, 1.0)
+    pcm16 = (clipped * 32767.0).astype(np.int16)
+    with wave.open(str(output_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm16.tobytes())
 
 
 def load_audio_mono(path: Path) -> tuple[np.ndarray, int]:
@@ -255,9 +345,49 @@ def slice_fractional_segment(samples: np.ndarray, start_pos: float, end_pos: flo
     interior = np.interp(interior_positions, xp, samples)
     tail_sample = float(np.interp(end_pos, xp, samples))
     segment = np.concatenate((interior, np.array([tail_sample], dtype=np.float64))).astype(np.float32, copy=False)
-    segment[0] = 0.0
-    segment[-1] = 0.0
     return segment
+
+
+def simple_overlap_add(loop_samples: np.ndarray, sr: int, overlap_sec: float = 0.1) -> np.ndarray:
+    """Simple overlap-add crossfade: overlap head and tail, shorten the loop.
+    
+    This is the most reliable way to create seamless loops.
+    The loop becomes shorter by `overlap_sec` seconds.
+    """
+    overlap = int(overlap_sec * sr)
+    n = loop_samples.size
+    
+    # Ensure overlap is reasonable
+    overlap = max(64, min(overlap, n // 2 - 64))
+    if n <= overlap * 2 + 64:
+        return loop_samples
+    
+    result_len = n - overlap
+    result = np.zeros(result_len, dtype=np.float32)
+    
+    # Copy the middle section as-is
+    result[overlap:] = loop_samples[overlap:n - overlap]
+    
+    # Overlap-add the head and tail
+    head = loop_samples[:overlap].astype(np.float32, copy=False)
+    tail = loop_samples[n - overlap:].astype(np.float32, copy=False)
+    
+    # Simple linear crossfade (more stable for volume)
+    ramp = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
+    crossfaded = tail * (1.0 - ramp) + head * ramp
+    
+    # Normalize crossfaded section to match average RMS of head/tail
+    eps = 1e-12
+    target_rms = 0.5 * (np.sqrt(np.mean(head * head) + eps) + np.sqrt(np.mean(tail * tail) + eps))
+    cross_rms = np.sqrt(np.mean(crossfaded * crossfaded) + eps)
+    if cross_rms > eps:
+        gain = float(target_rms / cross_rms)
+        gain = np.clip(gain, 0.7, 1.3)
+        crossfaded = crossfaded * gain
+    
+    result[:overlap] = crossfaded
+    
+    return result
 
 
 def extract_loop(samples: np.ndarray, sr: int, start_sec: float, end_sec: float, radius: int) -> np.ndarray:
@@ -270,19 +400,15 @@ def extract_loop(samples: np.ndarray, sr: int, start_sec: float, end_sec: float,
     end_idx = clamp_sample_index(end_idx, total)
     if end_idx <= start_idx:
         raise LoopProcessingError("Invalid indices after clamping")
-    approx_len = end_idx - start_idx
-    zero_start = find_zero_cross(samples, float(start_idx), radius)
-    corr_anchor = clamp_sample_index(int(round(zero_start.position)), total - 1)
-    best_len = find_best_loop_length(samples, corr_anchor, zero_start.position, approx_len, radius)
-    corr_end = zero_start.position + best_len
-    corr_end = float(min(max(corr_end, 0.0), total - 1))
-    zero_end = find_zero_cross(samples, corr_end, radius, preferred_slope=zero_start.slope)
-    if zero_end.position <= zero_start.position:
-        raise LoopProcessingError("Zero-cross search collapsed loop window")
-    loop = slice_fractional_segment(samples, zero_start.position, zero_end.position)
-    if loop.size < sr // 20:  # <50ms guard
+    
+    # Simple approach: just cut the segment, no fancy zero-cross hunting
+    loop = samples[start_idx:end_idx].astype(np.float32, copy=True)
+    
+    if loop.size < sr // 10:  # <100ms guard
         raise LoopProcessingError("Looped segment is too short")
-    return apply_zero_locked_crossfade(loop)
+    
+    # Apply overlap-add crossfade (0.5 second overlap)
+    return simple_overlap_add(loop, sr, overlap_sec=0.5)
 
 
 def encode_vorbis(loop_samples: np.ndarray, sr: int, quality: int, output_path: Path, ffmpeg_path: str = "ffmpeg") -> None:

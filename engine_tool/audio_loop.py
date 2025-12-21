@@ -348,17 +348,47 @@ def slice_fractional_segment(samples: np.ndarray, start_pos: float, end_pos: flo
     return segment
 
 
-def simple_overlap_add(loop_samples: np.ndarray, sr: int, overlap_sec: float = 0.1) -> np.ndarray:
+def _compute_envelope(samples: np.ndarray, frame_size: int) -> np.ndarray:
+    """Compute RMS envelope per frame, then interpolate back to sample rate."""
+    n = samples.size
+    if n < frame_size:
+        rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
+        return np.full(n, rms, dtype=np.float32)
+    
+    # Compute RMS per frame
+    num_frames = n // frame_size
+    remainder = n % frame_size
+    frames = samples[:num_frames * frame_size].reshape(num_frames, frame_size)
+    frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12).astype(np.float32)
+    
+    # Handle remainder
+    if remainder > 0:
+        last_rms = float(np.sqrt(np.mean(samples[-remainder:] ** 2) + 1e-12))
+        frame_rms = np.append(frame_rms, last_rms)
+    
+    # Interpolate back to sample rate
+    frame_centers = np.arange(len(frame_rms)) * frame_size + frame_size // 2
+    frame_centers = np.clip(frame_centers, 0, n - 1)
+    sample_indices = np.arange(n)
+    envelope = np.interp(sample_indices, frame_centers, frame_rms).astype(np.float32)
+    
+    return envelope
+
+
+def simple_overlap_add(loop_samples: np.ndarray, sr: int, overlap_sec: float = 0.05) -> np.ndarray:
     """Simple overlap-add crossfade: overlap head and tail, shorten the loop.
     
-    This is the most reliable way to create seamless loops.
+    Uses a SHORT crossfade (default 50ms) to minimize phase interference issues.
+    Short crossfades work well for periodic signals like engine sounds because
+    they don't give the out-of-phase portions enough time to cause audible cancellation.
+    
     The loop becomes shorter by `overlap_sec` seconds.
     """
     overlap = int(overlap_sec * sr)
     n = loop_samples.size
     
-    # Ensure overlap is reasonable
-    overlap = max(64, min(overlap, n // 2 - 64))
+    # Ensure overlap is reasonable (minimum 32 samples, max 1/4 of loop)
+    overlap = max(32, min(overlap, n // 4))
     if n <= overlap * 2 + 64:
         return loop_samples
     
@@ -372,18 +402,9 @@ def simple_overlap_add(loop_samples: np.ndarray, sr: int, overlap_sec: float = 0
     head = loop_samples[:overlap].astype(np.float32, copy=False)
     tail = loop_samples[n - overlap:].astype(np.float32, copy=False)
     
-    # Simple linear crossfade (more stable for volume)
-    ramp = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
-    crossfaded = tail * (1.0 - ramp) + head * ramp
-    
-    # Normalize crossfaded section to match average RMS of head/tail
-    eps = 1e-12
-    target_rms = 0.5 * (np.sqrt(np.mean(head * head) + eps) + np.sqrt(np.mean(tail * tail) + eps))
-    cross_rms = np.sqrt(np.mean(crossfaded * crossfaded) + eps)
-    if cross_rms > eps:
-        gain = float(target_rms / cross_rms)
-        gain = np.clip(gain, 0.7, 1.3)
-        crossfaded = crossfaded * gain
+    # Simple linear crossfade - no power compensation needed for short crossfades
+    t = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
+    crossfaded = tail * (1.0 - t) + head * t
     
     result[:overlap] = crossfaded
     
@@ -407,8 +428,8 @@ def extract_loop(samples: np.ndarray, sr: int, start_sec: float, end_sec: float,
     if loop.size < sr // 10:  # <100ms guard
         raise LoopProcessingError("Looped segment is too short")
     
-    # Apply overlap-add crossfade (0.5 second overlap)
-    return simple_overlap_add(loop, sr, overlap_sec=0.5)
+    # Apply overlap-add crossfade (50ms - short to minimize phase interference)
+    return simple_overlap_add(loop, sr, overlap_sec=0.05)
 
 
 def encode_vorbis(loop_samples: np.ndarray, sr: int, quality: int, output_path: Path, ffmpeg_path: str = "ffmpeg") -> None:
